@@ -7,8 +7,14 @@ const capName = c => isNs(c) ? 'Quota' : 'Allocatable';
 function scopeText(c) {
   if (!c.scope) return '';
   if (!isNs(c)) return 'Cluster-wide access';
-  return `Namespaces: ${(c.scopeNamespaces || []).join(', ')}`;
+  return `Namespaces: ${nsShort(c.scopeNamespaces)}`;
 }
+// "a, b, c +12 more" for long namespace lists in one-line places
+function nsShort(list, max = 3) {
+  list = list || [];
+  return list.length <= max ? list.join(', ') : `${list.slice(0, max).join(', ')} +${list.length - max} more`;
+}
+const FOUND_BY = { rancher: 'found automatically from your Rancher projects', namespaces: 'found automatically (namespaces where you may list pods)' };
 async function openAccess(ctx) {
   const c = (await api('clusters')).find(x => x.name === ctx) || {};
   const dlg = document.createElement('dialog');
@@ -17,13 +23,16 @@ async function openAccess(ctx) {
     <h3>Access for ${esc(shortName(ctx))}</h3>
     <p class="muted" style="margin:0">How KubeLamp reads this cluster with your kubeconfig credentials.</p>
     <label class="radio"><input type="radio" name="mode" value="auto"><span><b>Automatic</b> — recommended${esc(detected)}
-      <small>Use cluster-wide access if your user has a ClusterRole; if not, read only the namespaces below.</small></span></label>
+      <small>Use cluster-wide access if your user has a ClusterRole; if not, read the namespaces you have access to.</small></span></label>
     <label class="radio"><input type="radio" name="mode" value="cluster"><span><b>Cluster-wide</b>
       <small>Needs ClusterRole + ClusterRoleBinding. Shows nodes, every namespace and node capacity.</small></span></label>
     <label class="radio"><input type="radio" name="mode" value="namespaced"><span><b>Only my namespaces</b>
-      <small>For users with Role + RoleBinding only. KubeLamp never makes cluster-scoped calls.</small></span></label>
-    <label class="field">Namespaces you have access to
-      <small>Comma or newline separated.${c.namespace ? ` The context's namespace <code>${esc(c.namespace)}</code> is always included.` : ' Without any, “default” is used.'}</small>
+      <small>For users with Role + RoleBinding only. KubeLamp doesn't read cluster-wide lists.</small></span></label>
+    ${c.scope === 'namespaced' ? `<div class="acc-found"><b>${c.scopeFoundBy ? `Found automatically (${c.scopeFoundBy === 'rancher' ? 'Rancher projects' : 'namespaces where you may list pods'})` : 'Not found automatically'}</b>
+      <span class="muted">${c.scopeFoundBy ? 'KubeLamp looks again every 10 minutes and when you save, so new RoleBindings appear on their own.' : 'Your user can\'t list namespaces and this isn\'t a Rancher cluster: type your namespaces below.'}</span>
+      ${(c.scopeNamespaces || []).length ? `<div class="chips acc-chips">${c.scopeNamespaces.map(n => `<span class="chip">${esc(n)}</span>`).join('')}</div>` : ''}</div>` : ''}
+    <label class="field">Extra namespaces (optional)
+      <small>Only for namespaces that aren't found automatically. Comma or newline separated.${c.namespace ? ` The context's namespace <code>${esc(c.namespace)}</code> is used when nothing is found.` : ''}</small>
       <textarea id="accNs" rows="3" spellcheck="false" placeholder="payments, ecrm">${esc((c.accessNamespaces || []).join(', '))}</textarea></label>
     <div class="err-line" id="accErr"></div>
     <div class="actions"><button type="button" class="btn" id="accCancel">Cancel</button><button type="submit" class="btn primary">Save</button></div>
@@ -35,7 +44,7 @@ async function openAccess(ctx) {
   $('form', dlg).addEventListener('submit', async e => {
     e.preventDefault();
     const body = { context: ctx, mode: $('input[name=mode]:checked', dlg).value, namespaces: $('#accNs', dlg).value.split(/[\s,;]+/).filter(Boolean) };
-    const r = await fetch('/api/access', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const r = await fetch(apiURL('access'), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const d = await r.json().catch(() => ({}));
     if (!r.ok) { $('#accErr', dlg).textContent = d.error || 'Could not save'; return; }
     $('button[type=submit]', dlg).textContent = 'Applying…';
@@ -101,7 +110,7 @@ function certCard(c) {
 async function viewHome() {
   const kc = await api('kubeconfig');
   S.kc = kc;
-  const sep = navigator.platform.startsWith('Win') ? ';' : ':';
+  if (kc.needsSetup) return viewConnect(kc);
   const render = async () => {
     await loadClusters(); renderNav({});
     const cards = S.clusters.map(c => {
@@ -125,7 +134,7 @@ async function viewHome() {
         <div style="display:flex;gap:4px;flex-direction:column;align-items:flex-end">${c.version ? `<span class="tag">${esc(c.version)}</span>` : ''}${c.current ? '<span class="tag cur">current</span>' : ''}${isNs(c) ? '<span class="tag" title="Role/RoleBinding access">namespace-scoped</span>' : ''}</div></div>
         ${body}</div>`;
     }).join('');
-    $('#cards').innerHTML = cards || `<div class="empty-state"><h2>No clusters yet</h2><p>Enter the path to your kubeconfig above.</p></div>`;
+    $('#cards').innerHTML = cards || `<div class="empty-state"><h2>No clusters yet</h2><p>The loaded kubeconfig has no contexts.</p><button class="btn primary" type="button" onclick="openKubeconfigs()">Add a kubeconfig</button></div>`;
     $$('.ccard', main).forEach(el => el.addEventListener('click', () => { location.hash = ctxPath(el.dataset.ctx) + '/overview'; }));
     $$('[data-access]', main).forEach(b => b.addEventListener('click', e => { e.stopPropagation(); openAccess(b.dataset.access); }));
     const ok = S.clusters.filter(c => c.status === 'ok' || c.status === 'partial').length;
@@ -133,20 +142,11 @@ async function viewHome() {
   };
   main.innerHTML = `
     <div class="page-head"><div><h1>All clusters</h1><div class="sub"><span id="kcStat"></span></div></div>
-      <div class="right"><button class="btn" id="refreshAll"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg>Refresh</button></div></div>
-    <form class="kcbar" id="kcForm"><label for="kcPath">Kubeconfig</label>
-      <input type="text" id="kcPath" spellcheck="false" value="${esc((kc.paths || []).join(sep))}" placeholder="${esc(kc.default)}">
-      <button class="btn primary" type="submit">Load</button></form>
+      <div class="right"><button class="btn" id="kcManage">${KC_ICON.file}Kubeconfigs</button><button class="btn" id="refreshAll"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg>Refresh</button></div></div>
     ${kc.error ? `<div class="banner err"><b>Kubeconfig problem.</b><span>${esc(kc.error)}</span></div>` : ''}
     <div class="grid g3" id="cards"></div>`;
-  $('#kcForm').addEventListener('submit', async e => {
-    e.preventDefault();
-    const r = await fetch('/api/kubeconfig', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths: $('#kcPath').value }) });
-    const d = await r.json().catch(() => ({}));
-    if (!r.ok) { alert(d.error || 'Could not load kubeconfig'); return; }
-    navigate();
-  });
-  $('#refreshAll').onclick = async () => { await fetch('/api/refresh', { method: 'POST' }); setTimeout(render, 1500); };
+  $('#kcManage').onclick = () => openKubeconfigs();
+  $('#refreshAll').onclick = async () => { await fetch(apiURL('refresh'), { method: 'POST' }); setTimeout(render, 1500); };
   await live(5000, render);
 }
 
@@ -164,7 +164,8 @@ function clusterHead(sum, title, crumbs = '') {
     ${c.version ? `<span>${esc(c.version)}</span>` : ''}<span class="mono">${esc(c.server)}</span><span>${esc(c.authType)}</span>
     <span class="muted" id="updated">updated ${c.at ? age(c.at) + ' ago' : '—'}</span></div></div>
     <div class="right"><button class="btn" id="accessBtn" title="Cluster-wide or namespace-scoped (Role/RoleBinding) access"><svg viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>${esc(isNs(c) ? 'Namespaces: ' + (c.scopeNamespaces || []).length : 'Access')}</button><button class="btn" id="refreshBtn"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg>Refresh</button></div></div>
-    ${isNs(c) ? `<div class="banner info"><b>Namespace-scoped.</b><span>Your credentials have Role/RoleBinding access, so KubeLamp shows only ${nsListHtml(c.scopeNamespaces || [])}. ${c.nodesTotal ? 'Nodes are shown because your user may list them; node requests count only your pods' : 'Nodes and cluster capacity need cluster-wide rights'}${c.cpu.quota || c.mem.quota ? '; ResourceQuota is used as the capacity line' : ''}. <a href="#" data-acc>Change namespaces</a></span></div>` : ''}
+    ${isNs(c) ? `<div class="banner info ns-banner"><b>Namespace-scoped</b><span><b>${(c.scopeNamespaces || []).length} namespace${(c.scopeNamespaces || []).length === 1 ? '' : 's'}</b>${c.scopeFoundBy ? ` ${FOUND_BY[c.scopeFoundBy] || 'found automatically'}` : ''}: ${nsListHtml(c.scopeNamespaces || [], 4)}
+      <span class="muted ns-note">${c.nodesTotal ? 'Nodes are shown because your user may list them; node requests count only your pods' : 'Nodes and cluster capacity need cluster-wide rights'}${c.cpu.quota || c.mem.quota ? '; ResourceQuota is used as the capacity line' : ''}. <a href="#" data-acc>Manage</a></span></span></div>` : ''}
     ${certBanner(c)}
     ${c.status === 'partial' ? `<div class="banner"><b>Some data is missing.</b><span>${esc(c.error)}</span></div>` : ''}
     ${!c.metricsAvailable ? (/forbidden|RBAC/i.test(c.metricsErr || '')
@@ -176,7 +177,7 @@ function bindRefresh(ctx, rerender) {
   if (a) a.onclick = () => openAccess(ctx);
   $$('[data-acc]', main).forEach(l => l.addEventListener('click', e => { e.preventDefault(); openAccess(ctx); }));
   const b = $('#refreshBtn');
-  if (b) b.onclick = async () => { b.disabled = true; await fetch('/api/refresh?ctx=' + enc(ctx), { method: 'POST' }); setTimeout(async () => { await rerender(); b.disabled = false; }, 1800); };
+  if (b) b.onclick = async () => { b.disabled = true; await fetch(apiURL('refresh?ctx=') + enc(ctx), { method: 'POST' }); setTimeout(async () => { await rerender(); b.disabled = false; }, 1800); };
 }
 
 // ------------------------------------------------------------------ OVERVIEW
@@ -216,7 +217,7 @@ async function viewOverview(route) {
     ], d.problems, { href: p => ctxPath(ctx) + '/pod/' + enc(p.namespace) + '/' + enc(p.name) });
     main.innerHTML = clusterHead(s, shortName(ctx)) + `
       <div class="tiles">
-        ${ns ? `<div class="card tile"><div class="label">Namespaces</div><div class="value">${(s.scopeNamespaces || []).length}</div><div class="foot" title="${esc((s.scopeNamespaces || []).join(', '))}">${esc((s.scopeNamespaces || []).join(', '))}</div></div>`
+        ${ns ? `<div class="card tile"><div class="label">Namespaces</div><div class="value">${(s.scopeNamespaces || []).length}</div><div class="foot" title="${esc((s.scopeNamespaces || []).join(', '))}">${esc(nsShort(s.scopeNamespaces))}</div></div>`
           : `<div class="card tile"><div class="label">Nodes ready</div><div class="value">${s.nodesReady}<small>/ ${s.nodesTotal}</small></div><div class="foot">${s.nodesReady === s.nodesTotal ? stLabel('all ready', 'good') : stLabel((s.nodesTotal - s.nodesReady) + ' not ready', 'critical')}</div></div>`}
         <div class="card tile"><div class="label">Pods running</div><div class="value">${fmtNum(s.pods.running)}<small>/ ${fmtNum(s.pods.total)}</small></div><div class="foot">${s.pods.problem ? stLabel(s.pods.problem + (s.pods.problem > 1 ? ' need' : ' needs') + ' attention', 'critical') : stLabel('no problems', 'good')}</div></div>
         <div class="card tile"><div class="label">Deployments healthy</div><div class="value">${s.deployHealthy}<small>/ ${s.deployTotal}</small></div><div class="foot">${s.namespaces} namespaces</div></div>
@@ -281,7 +282,7 @@ async function viewNodes(route) {
     ], rows, { href: n => ctxPath(ctx) + '/node/' + enc(n.name) });
     if (isNs(sum) && !d.nodes.length) {
       main.innerHTML = clusterHead(sum, 'Nodes', `<div class="crumbs"><a href="${ctxPath(ctx)}/overview">${esc(shortName(ctx))}</a></div>`) +
-        `<div class="empty-state"><h2>Nodes need cluster-wide access</h2><p>Nodes are cluster-scoped, and your kubeconfig user only has Role/RoleBinding rights in ${esc((sum.scopeNamespaces || []).join(', '))}.</p>
+        `<div class="empty-state"><h2>Nodes need cluster-wide access</h2><p>Nodes are cluster-scoped, and your kubeconfig user only has Role/RoleBinding rights in ${esc(nsShort(sum.scopeNamespaces, 6))}.</p>
         <p class="muted">Pods still show which node they run on. To see nodes, ask for a ClusterRole with <code>get, list</code> on <code>nodes</code> (and <code>nodes</code> in <code>metrics.k8s.io</code>).</p></div>`;
       bindRefresh(ctx, render);
       return;
@@ -344,11 +345,17 @@ async function viewWorkloads(route) {
   const sum = (await api('clusters')).find(c => c.name === ctx);
   const kindQ = route.q.kind || '';
   main.innerHTML = clusterHead(sum, kindQ ? kindQ + 's' : 'Workloads', `<div class="crumbs"><a href="${ctxPath(ctx)}/overview">${esc(shortName(ctx))}</a></div>`) + `
-    <div class="filters"><select id="wkind"><option value="">All kinds</option>${['Deployment', 'StatefulSet', 'DaemonSet'].map(k => `<option ${k === kindQ ? 'selected' : ''}>${k}</option>`).join('')}</select>
-      <select id="whealth"><option value="">Any health</option><option value="healthy">Healthy</option><option value="unhealthy">Not healthy</option></select>
+    <div class="filters"><select id="wkind" data-label="Kind"><option value="">All kinds</option>${['Deployment', 'StatefulSet', 'DaemonSet'].map(k => `<option ${k === kindQ ? 'selected' : ''}>${k}</option>`).join('')}</select>
+      <select id="whealth" data-label="Health"><option value="">Any health</option><option value="healthy">Healthy</option><option value="unhealthy">Not healthy</option></select>
       <input type="search" id="wq" placeholder="Filter by name or image"><span class="count" id="wcount"></span></div>
+    <div id="wBulk"></div>
     <div class="card" id="wBox"><div class="muted">Loading…</div></div>`;
   bindRefresh(ctx, () => render());
+  const wsel = bulkSet('wl');
+  const wbar = () => bulkBar($('#wBulk'), wsel, { noun: kindQ || 'workload', onClear: render, onDelete: async () => {
+    const items = [...wsel].map(k => { const [kind, ns, name] = k.split('/'); const [g, r] = KIND_REF[kind]; return { ctx, group: g, resource: r, ns, name, kind }; });
+    if (await bulkDelete(items, kindQ || 'workload')) { wsel.clear(); await render(); }
+  } });
   const render = async () => {
     const d = await api(`workloads?ctx=${enc(ctx)}&ns=${enc(S.ns)}&kind=${enc($('#wkind').value)}`);
     const q = $('#wq').value.toLowerCase(), hf = $('#whealth').value;
@@ -364,8 +371,10 @@ async function viewWorkloads(route) {
       { key: 'spark', label: 'CPU 10m', nosort: true, render: w => spark(w.spark) },
       { key: 'created', label: 'Age', num: true, sort: w => -new Date(w.created), render: w => age(w.created) },
       { key: 'act', label: '', nosort: true, cls: 'act', render: w => `<a class="btn sm ghost" data-logs href="${ctxPath(ctx)}/logs?ns=${enc(w.namespace)}&kind=${enc(w.kind)}&name=${enc(w.name)}" title="Logs of all pods">${ICON.logs}Logs</a><button class="icon-btn" data-menu title="Actions">${ICON.more}</button>` },
-    ], rows, { href: w => `${ctxPath(ctx)}/wl/${enc(w.kind)}/${enc(w.namespace)}/${enc(w.name)}`, sort: { key: 'name', dir: 'asc' } });
+    ], rows, { href: w => `${ctxPath(ctx)}/wl/${enc(w.kind)}/${enc(w.namespace)}/${enc(w.name)}`, sort: { key: 'name', dir: 'asc' },
+      select: ro() ? null : { key: w => w.kind + '/' + w.namespace + '/' + w.name, set: wsel, onChange: wbar } });
     $('#wBox').innerHTML = t.html; t.bind($('#wBox'), render);
+    wbar();
     $$('[data-logs]', $('#wBox')).forEach(a => a.addEventListener('click', e => e.stopPropagation()));
     $$('[data-menu]', $('#wBox')).forEach(b => b.addEventListener('click', e => {
       e.stopPropagation();
@@ -461,8 +470,9 @@ async function viewPods(route) {
   const ctx = route.ctx;
   const sum = (await api('clusters')).find(c => c.name === ctx);
   main.innerHTML = clusterHead(sum, 'Pods', `<div class="crumbs"><a href="${ctxPath(ctx)}/overview">${esc(shortName(ctx))}</a></div>`) + `
-    <div class="filters"><select id="pst"><option value="">Any status</option><option value="problem">Needs attention</option><option value="Running">Running</option><option value="Pending">Pending</option><option value="Failed">Failed</option><option value="Succeeded">Completed</option></select>
+    <div class="filters"><select id="pst" data-label="Status"><option value="">Any status</option><option value="problem">Needs attention</option><option value="Running">Running</option><option value="Pending">Pending</option><option value="Failed">Failed</option><option value="Succeeded">Completed</option></select>
       <input type="search" id="pq" placeholder="Filter by name, owner or node"><span class="count" id="pcount"></span></div>
+    <div id="pBulk"></div>
     <div class="card" id="pBox"><div class="muted">Loading…</div></div>`;
   if (route.q.status) $('#pst').value = route.q.status;
   bindRefresh(ctx, () => render());
@@ -486,8 +496,15 @@ async function viewPods(route) {
       && (!stf || (stf === 'problem' ? p.problem : p.phase === stf)));
     const cols = podColumns(ctx, false);
     cols.push({ key: 'act', label: '', nosort: true, cls: 'act', render: p => `${ro() ? '' : `<button class="icon-btn" data-exec title="Exec shell">${ICON.term}</button>`}<button class="icon-btn" data-menu title="Actions">${ICON.more}</button>` });
-    const t = table('pods', cols, rows, { href: p => ctxPath(ctx) + '/pod/' + enc(p.namespace) + '/' + enc(p.name), limit: 1000 });
+    const psel = bulkSet('pods');
+    const pbar = () => bulkBar($('#pBulk'), psel, { noun: 'pod', onClear: render, onDelete: async () => {
+      const items = [...psel].map(k => { const [ns, name] = k.split('/'); return { ctx, group: '', resource: 'pods', ns, name, kind: 'Pod' }; });
+      if (await bulkDelete(items, 'pod')) { psel.clear(); await render(); }
+    } });
+    const t = table('pods', cols, rows, { href: p => ctxPath(ctx) + '/pod/' + enc(p.namespace) + '/' + enc(p.name), limit: 1000,
+      select: ro() ? null : { key: p => p.namespace + '/' + p.name, set: psel, onChange: pbar } });
     $('#pBox').innerHTML = t.html; t.bind($('#pBox'), render);
+    pbar();
     bindPodActions($('#pBox'), t.rows, ctx, render);
     $('#pcount').textContent = `${rows.length} of ${d.pods.length}`;
   };
@@ -544,7 +561,7 @@ async function viewEvents(route) {
   const ctx = route.ctx;
   const sum = (await api('clusters')).find(c => c.name === ctx);
   main.innerHTML = clusterHead(sum, 'Events', `<div class="crumbs"><a href="${ctxPath(ctx)}/overview">${esc(shortName(ctx))}</a></div>`) + `
-    <div class="filters"><select id="etype"><option value="Warning">Warnings</option><option value="">All types</option><option value="Normal">Normal</option></select>
+    <div class="filters"><select id="etype" data-label="Type"><option value="Warning">Warnings</option><option value="">All types</option><option value="Normal">Normal</option></select>
       <input type="search" id="eq" placeholder="Filter by reason, object or message"><span class="count" id="ecount"></span></div>
     <div class="card" id="eBox"><div class="muted">Loading…</div></div>`;
   bindRefresh(ctx, () => render());
@@ -582,20 +599,20 @@ async function viewLogs(route) {
   main.innerHTML = `<div class="logs-page">
     <div class="page-head" style="margin-bottom:10px"><div><div class="crumbs"><a href="${ctxPath(ctx)}/overview">${esc(shortName(ctx))}</a></div><h1>Logs</h1></div></div>
     <div class="logbar">
-      <select id="lns" title="Namespace">${await nsOptions(ctx, q.ns || S.ns || '', 'Namespace…')}</select>
-      <select id="lwl" title="Deployment / workload" style="min-width:220px"><option value="">Deployment…</option></select>
+      <select id="lns" data-label="Namespace">${await nsOptions(ctx, q.ns || S.ns || '', 'Namespace…')}</select>
+      <select id="lwl" data-label="Workload" style="min-width:220px"><option value="">Choose a workload…</option></select>
       <button class="btn ${q.selector ? 'on' : ''}" id="selMode" title="Use a custom label selector instead">Label selector</button>
       <input type="text" id="lsel" placeholder="app=web,tier=api" spellcheck="false" style="width:220px" ${q.selector ? '' : 'hidden'} value="${esc(q.selector || '')}">
-      <select id="lct" title="Container"><option value="">All containers</option></select>
-      <select id="ltail" title="Lines per container">${[100, 200, 500, 1000, 5000].map(n => `<option ${n == (q.tail || 200) ? 'selected' : ''} value="${n}">last ${n}</option>`).join('')}</select>
-      <select id="lsince" title="Time window"><option value="">any time</option><option value="300">5 min</option><option value="900">15 min</option><option value="3600">1 hour</option><option value="21600">6 hours</option><option value="86400">24 hours</option></select>
+      <select id="lct" data-label="Containers"><option value="">All</option></select>
+      <select id="ltail" data-label="Lines" title="Lines per container">${[100, 200, 500, 1000, 5000].map(n => `<option ${n == (q.tail || 200) ? 'selected' : ''} value="${n}">last ${n}</option>`).join('')}</select>
+      <select id="lsince" data-label="Since" title="Time window"><option value="">any time</option><option value="300">5 min</option><option value="900">15 min</option><option value="3600">1 hour</option><option value="21600">6 hours</option><option value="86400">24 hours</option></select>
       <label class="ck"><input type="checkbox" id="lfollow" ${L.follow ? 'checked' : ''}>Follow</label>
       <label class="ck" title="Logs from the previous (crashed) container instance"><input type="checkbox" id="lprev">Previous</label>
     </div>
     <div class="logbar">
       <input type="search" id="lq" placeholder="Search… (regex ok)" style="width:260px">
       <label class="ck"><input type="checkbox" id="lonly">Only matching</label>
-      <select id="llevel"><option value="">All levels</option><option value="warn">Warn + error</option><option value="error">Errors only</option></select>
+      <select id="llevel" data-label="Level"><option value="">All levels</option><option value="warn">Warn + error</option><option value="error">Errors only</option></select>
       <span class="grow"></span>
       <label class="ck"><input type="checkbox" id="lts" checked>Timestamps</label>
       <label class="ck"><input type="checkbox" id="lwrap">Wrap</label>
@@ -610,10 +627,10 @@ async function viewLogs(route) {
   const view = $('#lview');
   const fillWorkloads = async () => {
     const ns = $('#lns').value;
-    if (!ns) { $('#lwl').innerHTML = '<option value="">Deployment…</option>'; return; }
+    if (!ns) { $('#lwl').innerHTML = '<option value="">Choose a workload…</option>'; return; }
     const d = await api(`workloads?ctx=${enc(ctx)}&ns=${enc(ns)}`);
     const by = k => d.workloads.filter(w => w.kind === k);
-    $('#lwl').innerHTML = '<option value="">Deployment…</option>' + ['Deployment', 'StatefulSet', 'DaemonSet'].filter(k => by(k).length)
+    $('#lwl').innerHTML = '<option value="">Choose a workload…</option>' + ['Deployment', 'StatefulSet', 'DaemonSet'].filter(k => by(k).length)
       .map(k => `<optgroup label="${k}s">${by(k).map(w => `<option value="${esc(k + '/' + w.name)}" ${q.kind === k && q.name === w.name ? 'selected' : ''}>${esc(w.name)} (${w.ready}/${w.desired})</option>`).join('')}</optgroup>`).join('');
   };
   await fillWorkloads();
@@ -719,7 +736,7 @@ async function viewLogs(route) {
     }));
     const cts = [...new Set(L.pods.flatMap(p => p.containers))];
     const cur = $('#lct').value;
-    if (!cur) $('#lct').innerHTML = '<option value="">All containers</option>' + cts.map(c => `<option>${esc(c)}</option>`).join('');
+    if (!cur) $('#lct').innerHTML = '<option value="">All</option>' + cts.map(c => `<option>${esc(c)}</option>`).join('');
   };
 
   // ---- streaming (fetch + manual SSE parsing so errors are readable and nothing auto-reconnects)
@@ -729,14 +746,14 @@ async function viewLogs(route) {
     if (!ready()) return;
     const p = params();
     history.replaceState(null, '', `${ctxPath(ctx)}/logs?` + new URLSearchParams([...p].filter(([k]) => !['ctx'].includes(k))));
-    $('#ldl').href = '/api/logs/download?' + p;
+    $('#ldl').href = apiURL('logs/download?') + p;
     L.lines = []; L.buffer = []; L.pods = []; L.hidden.clear(); L.colors.clear();
     view.innerHTML = ''; $('#lpods').innerHTML = ''; sys('Connecting…');
     $('#lstate').className = ''; $('#lstate').textContent = 'connecting…';
     const ctrl = new AbortController(); L.ctrl = ctrl;
     S.abort.signal.addEventListener('abort', () => ctrl.abort());
     let resp;
-    try { resp = await fetch('/api/logs?' + p, { signal: ctrl.signal }); }
+    try { resp = await fetch(apiURL('logs?') + p, { signal: ctrl.signal }); }
     catch (e) { if (e.name !== 'AbortError') { view.innerHTML = ''; sys('Connection failed: ' + e.message); } return; }
     if (!resp.ok) {
       const d = await resp.json().catch(() => ({}));
@@ -776,7 +793,7 @@ async function viewLogs(route) {
 
   // ---- controls
   $('#lns').addEventListener('change', async () => { await fillWorkloads(); start(); });
-  $('#lwl').addEventListener('change', () => { podOnly = ''; $('#podOnly')?.remove(); $('#lct').innerHTML = '<option value="">All containers</option>'; start(); });
+  $('#lwl').addEventListener('change', () => { podOnly = ''; $('#podOnly')?.remove(); $('#lct').innerHTML = '<option value="">All</option>'; start(); });
   $('#selMode').addEventListener('click', () => {
     const on = $('#lsel').hidden; $('#lsel').hidden = !on; $('#lwl').hidden = on; $('#selMode').classList.toggle('on', on);
     if (on) $('#lsel').focus(); else start();

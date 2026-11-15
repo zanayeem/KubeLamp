@@ -23,6 +23,7 @@ function findRes(ctx, group, resource) {
   return (S.disc[ctx]?.resources || []).find(r => r.group === group && r.resource === resource);
 }
 const plural = r => r ? (r.kind.endsWith('y') ? r.kind.slice(0, -1) + 'ies' : r.kind.endsWith('s') ? r.kind + 'es' : r.kind + 's') : '';
+const ICON_PLAY = '<svg viewBox="0 0 24 24"><path d="M7 4.5v15l12-7.5z"/></svg>';
 const can = (r, verb) => !ro() && (!r || (r.verbs || []).includes(verb));
 
 // ------------------------------------------------------------------ actions
@@ -58,6 +59,20 @@ const A = {
     if (!ok) return false;
     try { await send('POST', 'action', { ctx, group, resource, ns, name, action: 'restart' }); toast(`Restarted ${name}`); return true; }
     catch (e) { toast(e.message, 'err'); return false; }
+  },
+  // CronJob → create a Job from its template now; the Job is <cronjob>-manual-<UTC time>
+  async trigger(ctx, ns, name) {
+    const ts = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+    const ok = await modal({ title: `Run ${name} now?`,
+      body: `<p>Creates a Job from this CronJob's template, like <code>kubectl create job --from=cronjob/${esc(name)}</code>. The schedule isn't changed.</p>
+        <p class="muted">Job: <code>${esc(name)}-manual-${ts}</code> (UTC). Its pods are named after the Job plus a short random suffix.</p>`,
+      actions: [{ label: 'Cancel', value: false }, { label: 'Run now', kind: 'primary', value: true, submit: true }] });
+    if (!ok) return null;
+    try {
+      const d = await send('POST', 'action', { ctx, group: 'batch', resource: 'cronjobs', ns, name, action: 'trigger' });
+      toast(`Started Job ${d.job}`);
+      return d.job;
+    } catch (e) { toast(e.message, 'err'); return null; }
   },
   async cordon(ctx, name, on) {
     try { await send('POST', 'action', { ctx, group: '', resource: 'nodes', ns: '', name, action: on ? 'cordon' : 'uncordon' }); toast(`${on ? 'Cordoned' : 'Uncordoned'} ${name}`); return true; }
@@ -103,6 +118,9 @@ function objectMenu(anchor, o, after) {
     if (!ro() && kind !== 'DaemonSet') items.push({ label: 'Scale…', icon: ICON.scale, run: async () => { if (await A.scale(ctx, group, resource, ns, name, o.replicas)) after && after(); } });
     if (!ro()) items.push({ label: 'Restart', icon: ICON.restart, run: async () => { if (await A.restart(ctx, group, resource, ns, name, kind)) after && after(); } });
   }
+  if (kind === 'CronJob' && !ro() && can(findRes(ctx, 'batch', 'jobs'), 'create')) {
+    items.push({ label: 'Run now', icon: ICON_PLAY, run: async () => { const job = await A.trigger(ctx, ns, name); if (job) location.hash = objHref(ctx, 'batch', 'jobs', ns, job); } });
+  }
   if (kind === 'Node' && !ro()) {
     items.push({ label: o.cordoned ? 'Uncordon' : 'Cordon', icon: ICON.pause, run: async () => { if (await A.cordon(ctx, name, !o.cordoned)) after && after(); } });
   }
@@ -127,8 +145,11 @@ async function viewResource(route) {
   main.innerHTML = `<div class="page-head"><div><div class="crumbs"><a href="${ctxPath(ctx)}/overview">${esc(shortName(ctx))}</a>${group ? ` / <span class="mono">${esc(group)}</span>` : ''}</div>
       <h1>${esc(title)}</h1><div class="sub"><span>${res.namespaced ? (nsActive ? `Namespace ${esc(S.ns)}` : 'All namespaces') : 'Cluster-scoped'}</span><span class="muted mono">${esc(res.version)}</span></div></div>
       <div class="right"><button class="btn ghost" id="wideBtn" title="Show every column, like kubectl -o wide">Wide</button></div></div>
-    <div class="filters"><input type="search" id="rq" placeholder="Filter by name, label or any column" style="width:320px"><span class="count" id="rcount"></span></div>
-    <div class="card flush" id="rBox"><div class="muted" style="padding:16px">Loading…</div></div>`;
+    <div class="filters"><input type="search" id="rq" placeholder="Filter by name, label or any column" style="width:320px"><span id="rFilt"></span><span class="count" id="rcount"></span></div>
+    <div id="rBulk"></div>
+    <div class="card flush" id="rBox"><div class="muted" style="padding:16px">Loading…</div></div>
+    ${resource === 'ingressroutes' && group.startsWith('traefik') ? '<div id="rtUnder"></div>' : ''}`;
+  if ($('#rtUnder')) httpRoutesUnder(ctx, $('#rtUnder'));
   let wide = false, data = null;
   const isPvc = resource === 'persistentvolumeclaims' && group === '';
   if (isPvc) {
@@ -157,12 +178,51 @@ async function viewResource(route) {
   };
   $('#wideBtn').onclick = () => { wide = !wide; $('#wideBtn').classList.toggle('on', wide); draw(); };
   $('#rq').addEventListener('input', () => draw());
+  // dropdown filters next to the search box: Status (any type with that column) and, for
+  // PersistentVolumes, the namespace of the claim. Default: all.
+  const isPV = resource === 'persistentvolumes' && group === '';
+  const colOf = name => data.columns.findIndex(c => c.name.toLowerCase() === name);
+  const claimNs = r => { const v = String(r.cells[colOf('claim')] ?? ''); return v.includes('/') ? v.split('/')[0] : ''; };
+  const filters = () => {
+    const out = [];
+    const st = colOf('status');
+    if (st >= 0) out.push({ id: 'rfStatus', label: 'Status', all: 'All', val: r => String(r.cells[st] ?? '') || '—' });
+    if (isPV && colOf('claim') >= 0) out.push({ id: 'rfClaim', label: 'Claim namespace', all: 'All', val: r => claimNs(r) || '(no claim)' });
+    const sc = colOf('storageclass');
+    if (sc >= 0) out.push({ id: 'rfClass', label: 'StorageClass', all: 'All', val: r => String(r.cells[sc] ?? '') || '(none)' });
+    return out;
+  };
+  const syncFilters = () => {
+    const box = $('#rFilt');
+    filters().forEach(f => {
+      let s = $('#' + f.id);
+      if (!s) {
+        box.insertAdjacentHTML('beforeend', `<select id="${f.id}" data-label="${esc(f.label)}"></select>`);
+        s = $('#' + f.id);
+        s.addEventListener('change', () => draw());
+      }
+      const counts = {};
+      data.rows.forEach(r => { const v = f.val(r); counts[v] = (counts[v] || 0) + 1; });
+      const keys = Object.keys(counts).sort((a, b) => a.localeCompare(b));
+      const sig = keys.map(k => k + counts[k]).join('|');
+      if (s.dataset.sig === sig) return;
+      const cur = s.value;
+      s.dataset.sig = sig;
+      s.innerHTML = `<option value="">${f.all}</option>` + keys.map(k => `<option value="${esc(k)}" data-meta="${counts[k]}">${esc(k)}</option>`).join('');
+      s.value = keys.includes(cur) ? cur : '';
+    });
+  };
+  const sel = bulkSet('res-' + resource);
+  const canDel = can(res, 'delete');
   const draw = () => {
     if (!data) return;
+    syncFilters();
     const q = $('#rq').value.toLowerCase();
     const showNs = res.namespaced && !nsActive;
     const colIdx = data.columns.map((c, i) => [c, i]).filter(([c]) => (wide || !c.priority) && c.name.toLowerCase() !== 'name');
-    const rows = data.rows.filter(r => !q || (r.name + ' ' + (r.namespace || '') + ' ' + JSON.stringify(r.cells) + ' ' + Object.entries(r.labels || {}).map(([k, v]) => k + '=' + v).join(' ')).toLowerCase().includes(q));
+    const active = filters().map(f => [f, $('#' + f.id)?.value || '']).filter(([, v]) => v);
+    const rows = data.rows.filter(r => (!q || (r.name + ' ' + (r.namespace || '') + ' ' + JSON.stringify(r.cells) + ' ' + Object.entries(r.labels || {}).map(([k, v]) => k + '=' + v).join(' ')).toLowerCase().includes(q))
+      && active.every(([f, v]) => f.val(r) === v));
     const cols = [{ key: 'name', label: 'Name', cls: 'name', render: r => `<a href="${richHref(ctx, res.kind, r.namespace, r.name) || objHref(ctx, group, resource, r.namespace, r.name)}">${esc(r.name)}</a>` }];
     if (showNs) cols.push({ key: 'namespace', label: 'Namespace' });
     colIdx.forEach(([c, i]) => cols.push({
@@ -173,9 +233,11 @@ async function viewResource(route) {
     if (isPvc) cols.push({ key: 'usage', label: 'Usage (df)', sort: r => S.pvc[pvcKey(ctx, r.namespace, r.name)]?.pct ?? -1,
       render: r => pvcCell(S.pvc[pvcKey(ctx, r.namespace, r.name)]) });
     cols.push({ key: 'act', label: '', nosort: true, cls: 'act', render: () => `<button class="icon-btn" data-menu title="Actions">${ICON.more}</button>` });
-    const t = table('res-' + resource, cols, rows, { sort: { key: 'name', dir: 'asc' } });
+    const key = r => (r.namespace || '') + '/' + r.name;
+    const t = table('res-' + resource, cols, rows, { sort: { key: 'name', dir: 'asc' }, select: canDel ? { key, set: sel, onChange: bar } : null });
     $('#rBox').innerHTML = t.html;
     t.bind($('#rBox'), draw);
+    bar();
     $$('[data-menu]', $('#rBox')).forEach(b => b.addEventListener('click', e => {
       e.stopPropagation();
       const r = t.rows[+b.closest('tr').dataset.i];
@@ -184,6 +246,12 @@ async function viewResource(route) {
     $('#rcount').textContent = `${rows.length} of ${data.rows.length}`;
     if (data.warnings?.length) $('#rBox').insertAdjacentHTML('afterbegin', `<div class="banner" style="margin:12px"><b>Partly visible.</b><span>${esc(data.warnings.join('; '))}</span></div>`);
   };
+  function bar() {
+    bulkBar($('#rBulk'), sel, { noun: res.kind, onClear: draw, onDelete: async () => {
+      const items = [...sel].map(k => { const [ns, name] = k.split('/'); return { ctx, group, resource, ns, name, kind: res.kind }; });
+      if (await bulkDelete(items, res.kind)) { sel.clear(); await load(); }
+    } });
+  }
   const load = async () => {
     try {
       const first = !data;
@@ -261,6 +329,7 @@ async function viewObject(route) {
   if (rich) actions.push(`<a class="btn" href="${rich}">${ICON.eye}Dashboard</a>`);
   if (kind === 'Pod' && !ro()) actions.push(`<button class="btn" data-act="exec">${ICON.term}Exec</button>`);
   if (['Deployment', 'StatefulSet', 'DaemonSet'].includes(kind)) actions.push(`<button class="btn" data-act="logs">${ICON.logs}Logs</button>`);
+  if (kind === 'CronJob' && !ro() && can(findRes(ctx, 'batch', 'jobs'), 'create')) actions.push(`<button class="btn primary" data-act="trigger">${ICON_PLAY}Run now</button>`);
   actions.push(`<button class="btn" data-act="yaml">${ICON.edit}${editable ? 'Edit YAML' : 'YAML'}</button>`);
   if (can(res, 'delete')) actions.push(`<button class="btn danger" data-act="delete">${ICON.del}Delete</button>`);
   actions.push(`<button class="btn ghost" data-act="more" title="More actions">${ICON.more}</button>`);
@@ -275,6 +344,7 @@ async function viewObject(route) {
     const a = b.dataset.act;
     if (a === 'exec') A.exec(ctx, ns, name, (o.spec?.containers || []).map(c => c.name));
     if (a === 'logs') A.logs(ctx, ns, kind, name);
+    if (a === 'trigger') A.trigger(ctx, ns, name).then(job => { if (job) location.hash = objHref(ctx, 'batch', 'jobs', ns, job); });
     if (a === 'yaml') show('yaml');
     if (a === 'delete') A.del(ctx, group, resource, ns, name, kind).then(ok => { if (ok) location.hash = listHref(ctx, group, resource); });
     if (a === 'more') objectMenu(b, { ctx, group, resource, ns, name, kind, replicas: o.spec?.replicas, cordoned: o.spec?.unschedulable, containers: (o.spec?.containers || []).map(c => c.name) },
@@ -334,6 +404,9 @@ function renderOverview(o, kind, ctx) {
       $('#pvcRe')?.addEventListener('click', () => run(true));
       run(false);
     });
+  } else if (['IngressRoute', 'HTTPRoute', 'Ingress'].includes(kind)) {
+    special = `<div class="card" id="rtDetail"><span class="muted">Loading routing…</span></div>`;
+    setTimeout(() => routeDetailCard(ctx, kind, md.namespace || '', md.name));
   } else if (kind === 'Service') {
     const sp = o.spec || {};
     special = `<div class="card"><h3>Service</h3><div class="kvgrid" style="margin-top:8px">

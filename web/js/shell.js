@@ -39,9 +39,11 @@ const NAV = [
   ['Workloads', [['Deployments', 'wl:Deployment'], ['StatefulSets', 'wl:StatefulSet'], ['DaemonSets', 'wl:DaemonSet'], ['Pods', 'pods'],
     ['Jobs', ['batch', 'jobs']], ['CronJobs', ['batch', 'cronjobs']], ['ReplicaSets', ['apps', 'replicasets']],
     ['Autoscalers', ['autoscaling', 'horizontalpodautoscalers']], ['Pod disruption budgets', ['policy', 'poddisruptionbudgets']], ['Deployment logs', 'logs']]],
-  ['Network', [['Services', ['', 'services']], ['Ingresses', ['networking.k8s.io', 'ingresses']], ['Ingress classes', ['networking.k8s.io', 'ingressclasses']],
+  ['Network', [['Routing', 'routes'], ['Services', ['', 'services']], ['Ingresses', ['networking.k8s.io', 'ingresses']],
+    ['IngressRoutes', [['traefik.io', 'ingressroutes'], ['traefik.containo.us', 'ingressroutes']]],
+    ['HTTPRoutes', ['gateway.networking.k8s.io', 'httproutes'], 'sub'], ['GRPCRoutes', ['gateway.networking.k8s.io', 'grpcroutes'], 'sub'],
+    ['Ingress classes', ['networking.k8s.io', 'ingressclasses']],
     ['Gateways', ['gateway.networking.k8s.io', 'gateways']], ['Gateway classes', ['gateway.networking.k8s.io', 'gatewayclasses']],
-    ['HTTPRoutes', ['gateway.networking.k8s.io', 'httproutes']], ['GRPCRoutes', ['gateway.networking.k8s.io', 'grpcroutes']],
     ['Network policies', ['networking.k8s.io', 'networkpolicies']], ['Cilium policies', ['cilium.io', 'ciliumnetworkpolicies']],
     ['Cilium cluster policies', ['cilium.io', 'ciliumclusterwidenetworkpolicies']], ['Endpoint slices', ['discovery.k8s.io', 'endpointslices']]]],
   ['Config', [['ConfigMaps', ['', 'configmaps']], ['Secrets', ['', 'secrets']], ['ExternalSecrets', ['external-secrets.io', 'externalsecrets']],
@@ -78,8 +80,9 @@ function navModel(route) {
   const disc = S.disc[ctx];
   const has = (g, r) => !disc || disc.resources.some(x => x.group === g && x.resource === r);
   const cur = route.section === 'r' ? `r:${gv(route.args[0])}/${route.args[1]}` : route.section === 'workloads' ? 'wl:' + (route.q.kind || '') : route.section;
-  const item = (label, target) => {
+  const item = (label, target, sub) => {
     let href, key;
+    if (Array.isArray(target) && Array.isArray(target[0])) target = target.find(t => has(t[0], t[1])) || target[0]; // alternative API groups
     if (Array.isArray(target)) {
       if (!has(target[0], target[1])) return null;
       href = listHref(ctx, target[0], target[1]); key = `r:${target[0]}/${target[1]}`;
@@ -88,12 +91,14 @@ function navModel(route) {
     } else { href = `${ctxPath(ctx)}/${target}`; key = target; }
     const on = key === cur || (route.section === 'wl' && key === 'wl:' + route.args[0]) || (route.section === 'node' && key === 'nodes') || (route.section === 'pod' && key === 'pods')
       || (route.section === 'o' && key === `r:${gv(route.args[0])}/${route.args[1]}`);
-    return { label, href, on };
+    return { label, href, on, sub: !!sub };
   };
-  const groups = NAV.map(([label, items]) => ({ label, items: items.map(([l, t]) => item(l, t)).filter(Boolean) }));
+  const groups = NAV.map(([label, items]) => ({ label, items: items.map(([l, t, sub]) => item(l, t, sub)).filter(Boolean) }));
+  // HTTPRoutes/GRPCRoutes nest under IngressRoutes only when Traefik is installed
+  groups.forEach(g => g.items.forEach((it, i) => { if (it.sub && !g.items.slice(0, i).some(p => p.label === 'IngressRoutes')) it.sub = false; }));
   // custom resources: everything else the cluster serves, grouped by API group
   if (disc) {
-    const known = new Set(NAV.flatMap(([, items]) => items.filter(([, t]) => Array.isArray(t)).map(([, t]) => t.join('/'))));
+    const known = new Set(NAV.flatMap(([, items]) => items.filter(([, t]) => Array.isArray(t)).flatMap(([, t]) => Array.isArray(t[0]) ? t.map(x => x.join('/')) : [t.join('/')])));
     const crds = disc.resources.filter(r => !BUILTIN_GROUPS.has(r.group) && !known.has(r.group + '/' + r.resource));
     const byGroup = {};
     crds.forEach(r => (byGroup[r.group] = byGroup[r.group] || []).push(r));
@@ -107,30 +112,64 @@ function navModel(route) {
   return groups.filter(g => g.items.some(i => !i.head));
 }
 
+// highlight the search text in a label
+function navMark(label, q) {
+  const i = q ? label.toLowerCase().indexOf(q) : -1;
+  return i < 0 ? esc(label) : esc(label.slice(0, i)) + '<mark>' + esc(label.slice(i, i + q.length)) + '</mark>' + esc(label.slice(i + q.length));
+}
+const navQ = () => ($('#navQ')?.value || '').trim().toLowerCase();
+
 function renderNav(route) {
   const nav = $('#nav'), rail = $('#rail');
+  const q = navQ();
+  if (!route.ctx && q) { // search the cluster list
+    const hits = S.clusters.filter(c => shortName(c.name).toLowerCase().includes(q));
+    nav.innerHTML = `<div class="nav-hint">${hits.length} cluster${hits.length === 1 ? '' : 's'} match “${esc(q)}”</div><div class="nav-res">` +
+      hits.map(c => `<a class="nav-a" href="${ctxPath(c.name)}/overview"><span class="n"><i class="dot ${c.status}"></i> ${navMark(shortName(c.name), q)}</span></a>`).join('') + '</div>';
+    navKb(0);
+    return;
+  }
   if (!route.ctx) {
-    nav.innerHTML = `<a class="nav-a on" href="#/">All clusters</a><div class="nav-h" style="cursor:default">Clusters</div>` +
+    nav.innerHTML = `<a class="nav-a ${route.page ? '' : 'on'}" href="#/">All clusters</a><div class="nav-h" style="cursor:default">Clusters</div>` +
       (S.clusters.map(c => `<a class="nav-a" href="${ctxPath(c.name)}/overview" title="${esc(c.name)}"><i class="dot ${c.status}"></i><span class="n">${esc(shortName(c.name))}</span>${c.scope === 'namespaced' ? '<span class="tag" title="Role/RoleBinding access">ns</span>' : ''}</a>`).join('')
         || '<div class="muted" style="padding:6px 10px">No contexts loaded</div>');
-    rail.innerHTML = `<a class="rail-b on" href="#/" title="All clusters">${railIcon('All clusters')}</a><div class="rail-sep"></div>` +
+    rail.innerHTML = `<a class="rail-b ${route.page ? '' : 'on'}" href="#/" title="All clusters">${railIcon('All clusters')}</a><div class="rail-sep"></div>` +
       S.clusters.map(c => `<a class="rail-b" href="${ctxPath(c.name)}/overview" title="${esc(shortName(c.name))}"><b style="font-size:12px;font-weight:600">${esc(shortName(c.name).replace(/[^A-Za-z0-9]/g, '').slice(0, 2).toUpperCase())}</b><i class="dot ${c.status}"></i></a>`).join('');
     return;
   }
   const groups = navModel(route);
-  const group = (label, body) => {
-    const closed = navClosed(label);
-    return `<button class="nav-h ${closed ? 'closed' : ''}" data-g="${esc(label)}"><svg viewBox="0 0 24 24"><path d="M7 10l5 5 5-5"/></svg>${esc(label)}</button><div class="nav-sub" ${closed ? 'hidden' : ''}>${body}</div>`;
-  };
-  let html = `<a class="nav-a nav-back" href="#/"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 6l-6 6 6 6"/></svg>All clusters</a>`;
-  groups.forEach(g => {
-    html += group(g.label, g.items.map(i => i.head ? `<div class="muted" style="font-size:11.5px;padding:8px 10px 2px" title="${esc(i.head)}">${esc(i.head)}</div>`
-      : `<a class="nav-a ${i.on ? 'on' : ''}" href="${i.href}"><span class="n">${esc(i.label)}</span></a>`).join(''));
-  });
+  const icon = label => `<svg class="gi" viewBox="0 0 24 24">${NAV_ICON[label] || NAV_ICON['Custom resources']}</svg>`;
+  const chev = '<svg class="chev" viewBox="0 0 24 24"><path d="M7 10l5 5 5-5"/></svg>';
+  const link = (i, label) => `<a class="nav-a ${i.on ? 'on' : ''} ${i.sub && !q ? 'sub' : ''}" href="${i.href}">${i.sub && !q ? '<span class="nav-tree" aria-hidden="true"></span>' : ''}<span class="n">${label}</span></a>`;
+  let html;
+  if (q) {
+    // search: matching pages under their section; for custom resources the API group matches too
+    let n = 0;
+    html = groups.map(g => {
+      let head = '', out = '';
+      g.items.forEach(i => {
+        if (i.head) { head = i.head; return; }
+        if (!(i.label.toLowerCase().includes(q) || g.label.toLowerCase().includes(q) || head.toLowerCase().includes(q))) return;
+        n++;
+        out += link(i, navMark(i.label, q) + (head ? ` <span class="muted" style="font-size:11.5px">${esc(head)}</span>` : ''));
+      });
+      return out ? `<div class="nav-h" style="cursor:default">${icon(g.label)}${esc(g.label)}</div><div class="nav-sub nav-res">${out}</div>` : '';
+    }).join('');
+    html = `<div class="nav-hint">${n ? `${n} page${n === 1 ? '' : 's'} match “${esc(q)}” · ↑↓ Enter` : `No page matches “${esc(q)}”`}</div>` + html;
+  } else {
+    html = `<a class="nav-a nav-back" href="#/"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 6l-6 6 6 6"/></svg>All clusters</a>`;
+    groups.forEach(g => {
+      const closed = navClosed(g.label);
+      html += `<button class="nav-h ${closed ? 'closed' : ''}" data-g="${esc(g.label)}" aria-expanded="${!closed}">${icon(g.label)}${esc(g.label)}${chev}</button><div class="nav-sub" ${closed ? 'hidden' : ''}>` +
+        g.items.map(i => i.head ? `<div class="nav-grp" title="${esc(i.head)}">${esc(i.head)}</div>` : link(i, esc(i.label))).join('') + '</div>';
+    });
+  }
   nav.innerHTML = html;
+  if (q) navKb(0);
   $$('.nav-h', nav).forEach(h => h.addEventListener('click', () => {
     const closed = !h.classList.contains('closed');
     h.classList.toggle('closed', closed);
+    h.setAttribute('aria-expanded', !closed);
     h.nextElementSibling.hidden = closed;
     setNavClosed(h.dataset.g, closed);
   }));
@@ -143,6 +182,34 @@ function renderNav(route) {
       { side: 'right', title: g.label, search: g.items.length > 14, placeholder: 'Filter ' + g.label.toLowerCase() });
   }));
 }
+
+// ---- page search: "/" focuses it, arrows move, Enter opens, Esc clears
+let navKbI = 0;
+function navKb(i) {
+  const links = $$('#nav .nav-a');
+  if (!links.length) return;
+  navKbI = (i + links.length) % links.length;
+  links.forEach((a, k) => a.classList.toggle('kb', k === navKbI));
+  links[navKbI].scrollIntoView({ block: 'nearest' });
+}
+function clearNavQ() { $('#navQ').value = ''; renderNav(parseRoute()); }
+$('#navQ').addEventListener('input', () => renderNav(parseRoute()));
+$('#navQ').addEventListener('keydown', e => {
+  const links = $$('#nav .nav-a');
+  if (e.key === 'ArrowDown') { e.preventDefault(); navKb(navKbI + 1); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); navKb(navKbI - 1); }
+  else if (e.key === 'Enter' && navQ() && links[navKbI]) { e.preventDefault(); const href = links[navKbI].getAttribute('href'); clearNavQ(); location.hash = href; }
+  else if (e.key === 'Escape') { e.preventDefault(); clearNavQ(); e.target.blur(); }
+});
+$('#nav').addEventListener('click', e => { if (navQ() && e.target.closest('.nav-a')) setTimeout(clearNavQ); });
+document.addEventListener('keydown', e => {
+  if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return;
+  const t = e.target;
+  if (t.closest?.('input, textarea, select, [contenteditable], .xterm, dialog') || document.body.classList.contains('auth-on')) return;
+  if (document.body.classList.contains('side-min')) setSideMin(false);
+  e.preventDefault();
+  $('#navQ').focus();
+});
 
 // collapse / expand the sidebar; remembered in this browser
 function setSideMin(min) {
@@ -186,12 +253,13 @@ $('#nsPicker').addEventListener('click', async () => {
     ...nss.map(n => ({ label: n.name, on: n.name === S.ns, sub: n.pods ? `${n.pods} pods` : '', run: () => setNs(route.ctx, n.name) }))],
   { search: true, placeholder: 'Find a namespace' });
 });
+$('#userBtn').addEventListener('click', () => Auth.menu($('#userBtn')));
 $('#stopBtn').addEventListener('click', async () => {
   const ok = await modal({ title: 'Stop the KubeLamp server?', body: '<p>Dashboards, open terminals and log streams close. Open the KubeLamp app (or run <code>kubelamp</code>) to start it again.</p>',
     actions: [{ label: 'Cancel', value: false }, { label: 'Stop server', kind: 'danger solid', value: true, submit: true }] });
   if (!ok) return;
   S.timers.forEach(clearInterval); S.abort?.abort();
-  await fetch('/api/quit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).catch(() => {});
+  await fetch(apiURL('quit'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).catch(() => {});
   document.body.innerHTML = `<div style="grid-column:1/-1;grid-row:1/-1;display:grid;place-items:center;text-align:center;color:var(--ink-2)">
     <div><h2 style="color:var(--ink);font-weight:600;margin:0 0 6px">KubeLamp has stopped</h2><p style="margin:0">Open the app again to restart it. You can close this tab.</p></div></div>`;
 });
@@ -202,6 +270,7 @@ function parseRoute() {
   const [path, qs] = raw.split('?');
   const p = path.split('/').map(decodeURIComponent);
   const q = Object.fromEntries(new URLSearchParams(qs || ''));
+  if (p[0] === 'settings') return { page: 'settings', q };
   if (p[0] !== 'c' || !p[1]) return { q };
   return { ctx: p[1], section: p[2] || 'overview', args: p.slice(3), q };
 }
@@ -209,17 +278,19 @@ let lastCtx = null;
 async function navigate() {
   S.timers.forEach(clearInterval); S.timers = []; S.gen++; S.kick = null;
   S.abort?.abort(); S.abort = new AbortController();
-  S.redraw = null; hideTip(); closePop();
+  S.redraw = null; hideTip(); closePop(); DD.close(); S.bulk = {};
   const route = parseRoute();
   if (route.ctx && route.ctx !== lastCtx) { loadNs(route.ctx); lastCtx = route.ctx; }
   renderTop(route);
   renderNav(route);
+  $('#setBtn').classList.toggle('on', route.page === 'settings');
   if (route.ctx && !S.disc[route.ctx]) ensureDiscovery(route.ctx).then(() => { if (parseRoute().ctx === route.ctx) renderNav(parseRoute()); });
   const views = { overview: viewOverview, nodes: viewNodes, node: viewNode, workloads: viewWorkloads, wl: viewWorkload, pods: viewPods, namespaces: viewNamespaces, nsview: viewNsOverview, tools: viewTools,
-    pod: viewPod, events: viewEvents, logs: viewLogs, r: viewResource, o: viewObject };
+    pod: viewPod, events: viewEvents, logs: viewLogs, r: viewResource, o: viewObject, routes: viewRoutes };
   main.scrollTop = 0;
   try {
-    if (!route.ctx) await viewHome();
+    if (route.page === 'settings') viewSettings();
+    else if (!route.ctx) await viewHome();
     else await (views[route.section] || viewOverview)(route);
   } catch (e) {
     if (e.name === 'AbortError') return;
@@ -277,10 +348,14 @@ function live(ms, fn) {
 
 // ------------------------------------------------------------------ boot
 (async () => {
+  await Auth.ready(); // sign in (and replace a temporary password) before anything loads
   try {
     S.info = await api('info');
     $('#roBadge').hidden = !S.info.readOnly;
-    if (!S.info.shell) $('#termNew').title = S.info.readOnly ? 'Shell disabled in read-only mode' : 'Shell only available on localhost';
+    if (!S.info.shell) $('#termNew').title = S.info.readOnly ? 'Shell disabled in read-only mode' : !S.info.admin ? 'The local shell is for admins only' : 'Shell only available on localhost';
+    $('#stopBtn').hidden = !S.info.admin;
+    const u = S.info.user;
+    if (u) { $('#userBtn').hidden = false; $('#userName').textContent = u.username; $('#userInit').textContent = u.username.slice(0, 1).toUpperCase(); }
   } catch {}
   await loadClusters();
   navigate();

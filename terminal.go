@@ -36,10 +36,27 @@ func sameOrigin(r *http.Request) bool {
 		return true // non-browser client
 	}
 	u, err := url.Parse(o)
-	return err == nil && u.Host == r.Host
+	if err != nil {
+		return false
+	}
+	if u.Host == r.Host {
+		return true
+	}
+	// behind a reverse proxy that rewrites Host (nginx proxy_pass, Ingress), the
+	// browser's host arrives in X-Forwarded-Host. Browsers can't set that header on a
+	// cross-site request without a CORS preflight, which KubeLamp never allows.
+	if fh := r.Header.Get("X-Forwarded-Host"); fh != "" {
+		first := strings.TrimSpace(strings.Split(fh, ",")[0])
+		return strings.EqualFold(u.Host, first)
+	}
+	return false
 }
 
-func (s *Server) shellAllowed() bool { return !s.readOnly && (s.localOnly || s.allowShell) }
+// shellAllowed: the local shell runs on the server as KubeLamp's own OS user, so it can
+// read every user's data folder; only admins get it.
+func (s *Server) shellAllowed(r *http.Request) bool {
+	return !s.readOnly && (s.localOnly || s.allowShell) && s.isAdmin(r)
+}
 
 func (s *Server) terminalRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/exec", s.handleExec)
@@ -59,7 +76,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	c := s.reg.Get(q.Get("ctx"))
+	c := s.R(r).Get(q.Get("ctx"))
 	if c == nil || c.client == nil {
 		http.Error(w, "unknown context", http.StatusNotFound)
 		return
@@ -180,7 +197,7 @@ func (s *Server) handleShell(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cross-origin websocket blocked", http.StatusForbidden)
 		return
 	}
-	if !s.shellAllowed() {
+	if !s.shellAllowed(r) {
 		http.Error(w, "the local shell is disabled (read-only mode or non-local listen address)", http.StatusForbidden)
 		return
 	}
@@ -192,12 +209,10 @@ func (s *Server) handleShell(w http.ResponseWriter, r *http.Request) {
 	defer browser.Close()
 	say := func(text string) { _ = browser.WriteMessage(ws.OpBinary, []byte(text)) }
 
-	s.reg.mu.RLock()
-	paths := append([]string(nil), s.reg.paths...)
-	s.reg.mu.RUnlock()
+	paths := s.currentPaths(r)
 	kcEnv := strings.Join(paths, string(os.PathListSeparator))
 	var tmp string
-	if ctxName != "" && s.reg.Get(ctxName) != nil {
+	if ctxName != "" && s.R(r).Get(ctxName) != nil {
 		// A tiny kubeconfig listed first selects the context for this shell only;
 		// `kubectl config use-context` inside the shell also stays local to it.
 		f, err := os.CreateTemp("", "kubelamp-ctx-*.yaml")
