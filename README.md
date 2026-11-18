@@ -29,13 +29,24 @@ Point it at your kubeconfig and you get one web app for all your contexts. You c
 
 **Every resource type, including CRDs.** KubeLamp asks each cluster which resource types it serves and builds the navigation from that:
 - **Workloads:** Deployments, StatefulSets, DaemonSets, Pods, Jobs, CronJobs, HPAs
-- **Network:** Services, Ingresses, Traefik IngressRoutes (with HTTPRoutes nested under them), Gateways, NetworkPolicies, CiliumNetworkPolicies
+- **Network:** Services, Ingresses, Traefik IngressRoutes (with HTTPRoutes and Middlewares nested under them), Gateways, NetworkPolicies, CiliumNetworkPolicies
 - **Config:** ConfigMaps, Secrets, ExternalSecrets and SecretStores, quotas
 - **Storage:** PVCs, PVs, StorageClasses
 - **Access:** RBAC objects
 - **Custom resources:** any other CRD, grouped by API group
 
 Lists show the same columns as `kubectl get`, including CRD printer columns. A **Wide** toggle adds the extra columns from `-o wide`.
+
+**Nodes without node rights:** if your user can't list nodes (namespace-scoped, e.g. Rancher project members), the Nodes page lists the nodes your pods run on, with their host IPs. That's what `kubectl get pods -o wide` shows, read from the pods KubeLamp already has.
+- **Each node** shows how many of your pods run there and in which namespaces. The pod count links to those pods.
+- **External and internal IP columns:** the **External IP** (larger) is the address set by an admin, the node's ExternalIP, or Rancher's. The **Internal IP** is the address the node registered with Kubernetes. The download includes both and where the external one came from.
+- **Admins set external IPs:** use the pencil on a node, *Set manually* where none is known, or **Import IPs**, which takes the `.xlsx` workbook itself (every sheet), a CSV, or columns pasted from Excel (host name and IP per line).
+  - **Matching:** by host name, ignoring case and domain.
+  - **Storage:** `<data>/node-ips.json` (mode 600). The IPs are shown to every user, and an admin's value wins over the other sources.
+  - **Protected files:** workbooks with a sensitivity label or encryption can't be read; save a copy as plain `.xlsx` or CSV.
+- **IP addresses (how they're found):** a pod only knows the address its node registered with Kubernetes, and on some clusters that's an overlay address. KubeLamp looks for the node's other addresses in this order: the node objects (if you may list them), Rancher's node list, then Rancher's management API (`/v3/nodes`, which records each node's IP and external IP). When one of these is available, the real address is shown, with the registered one underneath. The download has *IP*, *Internal IP* and *External IP* columns.
+- **Cluster dropdown:** one cluster, or *All clusters* in one list.
+- **Download:** CSV or TXT, on this view and on the full Nodes view.
 
 **Delete many at once:** every resource list, plus the Pods and Workloads pages, has checkboxes. Shift-click selects a range, and the header box selects everything shown. *Delete N* lists every name before deleting; 10 or more need the count typed in.
 - **Filters:** only rows you can see stay selected, so changing a filter never leaves hidden rows marked for deletion.
@@ -50,6 +61,16 @@ Lists show the same columns as `kubectl get`, including CRD printer columns. A *
 - **Groups:** group headings with counts (for example Deployments / StatefulSets).
 - **Status:** ready pills such as `3/3`.
 - **Keyboard:** arrow keys, Enter, Esc, and type-ahead.
+
+**kubectl console (every user):** *Terminal* opens a console that runs `kubectl` with **your own kubeconfig**. *Cluster* and *Namespace* menus above it switch the target at any time, and the prompt shows `cluster:namespace`.
+- **Commands:** type `kubectl get pods`, `k get pods` or just `get pods`. One `| grep [-i] [-v] pattern` may follow.
+- **Interactive:** `exec -it`, `logs -f` and `get -w` work, and Ctrl+C stops them.
+- **Aliases:** `k` = kubectl, plus built-ins like `kgp` (get pods), `kgpa` (get pods -A), `kgd`, `kgs`, `kgn`, `kd`, `kdp`, `kl`, `klf` (logs -f), `kex` (exec -it), `krr` (rollout restart). Type `alias` to list them. Add your own with `alias kgw='kubectl get pods -o wide -w'` and remove one with `unalias kgw`. Your aliases are saved in your user folder, and the expanded command is checked like a typed one. ↑/↓ recall history, and Tab completes subcommands and resource types.
+- **It isn't a shell:** KubeLamp reads the line itself and starts `kubectl` directly, so `;`, `&&`, `$()` and redirection are just words. Each user gets a private HOME for kubectl's cache.
+- **Blocked, because they would reach files or the network of the KubeLamp server, where other users' kubeconfigs live:** local files (`-f path`, `-k`, `--from-file`, `--patch-file`, template files), `cp`, `edit`, `proxy`, `port-forward`, `plugin`, and switching credentials or servers (`--kubeconfig`, `--context`, `--server`, `--token`). `apply -f -` with pasted YAML works.
+- **Read-only mode:** only reading commands run (get, describe, logs, top, events, …).
+- **Audit:** every command is logged with the user's name; secret values are hidden.
+- **Admins** also keep the full *Server shell* (bash) in the terminal's *+* menu.
 
 **Run a CronJob now:** *Run now* in a CronJob's row menu, or on its page, creates a Job from the CronJob's template, like `kubectl create job --from=cronjob/<name>`, and opens it. The schedule isn't changed.
 - **Job name:** `<cronjob>-manual-<YYYYMMDD-HHMMSS>` (UTC), shortened to fit Kubernetes' 52-character limit. Its pods are named by Kubernetes: the Job name plus a short random suffix.
@@ -94,6 +115,13 @@ Choosing a namespace in the top namespace picker opens its overview.
 - **Limits:** claims with no running pod can't be measured, `subPath` mounts show the whole volume and are marked `~`, and `-read-only` mode turns this off because it needs exec.
 
 **Tools → Networking → Pod Connectivity Inspector** (the Tools button, left of Terminal): find out whether a firewall lets traffic from your workers reach an IP, port or domain, without any access to the nodes. It runs `nc`, `curl`, `wget` or bash `/dev/tcp`, whichever the container has, inside your pods.
+
+- **Test from every node (the default):** *Probe DaemonSet*.
+  - **How it runs:** KubeLamp starts a temporary DaemonSet in the namespace chosen at the top (one small pod on every node), waits until its pods run, probes from them, and deletes it, even when the test fails or is cancelled. DaemonSets left behind by a stopped KubeLamp are removed by the next test in that namespace.
+  - **Default pod:** `curlimages/curl` as non-root (65534), read-only root filesystem, all capabilities dropped, no service-account token, tiny resources. It tolerates all taints so it runs on every node.
+  - **Admins** can change the YAML under *DaemonSet YAML*, e.g. to pull the image from Harbor. It's kept in `<data>/probe-daemonset.yaml`. Others can read it.
+  - **Permissions:** the user's own RBAC must allow creating DaemonSets and pod exec in that namespace.
+- **Other modes:** *One pod per node*, *All running pods* and *Pick pods* test from your own pods instead.
 - **Targets:** single IPs, ranges (`172.18.1.32-40`, `10.0.0.254-10.0.1.9`), CIDR (`10.0.0.0/28`, down to /22), domains, `host:port`, and URLs. Ports can be `22-25`, comma separated, or both. A domain with no port is checked over HTTPS. Separate entries with commas, spaces or new lines. The limit is 1024 checks per run.
 - **Source pods:** one pod per node (default, because a firewall rule applies per worker), all running pods, or pods you pick. One exec per pod and batch runs every check in parallel inside the pod.
 - **Resolved IPs:** domain targets are resolved inside each pod first (with `getent`, `nslookup`, `dig` or `host`), so you see the destination IPs the pod really uses, under each target and in the details, CSV and firewall request text. When pods get different answers it says so; curl checks also show the IP they connected to.

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -22,8 +23,9 @@ import (
 var webFS embed.FS
 
 type Server struct {
-	reg        *Registry  // clusters when user accounts are off (tests only)
-	users      *UserStore // user accounts; each user has their own clusters
+	reg        *Registry    // clusters when user accounts are off (tests only)
+	users      *UserStore   // user accounts; each user has their own clusters
+	nodeIPs    *NodeIPStore // external node IPs set by admins
 	dataDir    string
 	localOnly  bool
 	readOnly   bool
@@ -248,7 +250,13 @@ func (s *Server) routes() http.Handler {
 		if !ok {
 			return
 		}
-		writeJSON(w, 200, map[string]any{"nodes": nodeViews(c, snap, false), "metrics": snap.MetricsAvailable})
+		nv := nodeViews(c, snap, false)
+		for i := range nv { // an admin-set external IP wins
+			if ip := s.nodeIPs.Lookup(nv[i].Name); ip != "" {
+				nv[i].ExternalIP, nv[i].ExternalSrc = ip, "manual"
+			}
+		}
+		writeJSON(w, 200, map[string]any{"nodes": nv, "metrics": snap.MetricsAvailable})
 	})
 
 	mux.HandleFunc("GET /api/node", func(w http.ResponseWriter, r *http.Request) {
@@ -453,6 +461,9 @@ func (s *Server) routes() http.Handler {
 	s.resourceRoutes(mux)
 	s.kubeconfigRoutes(mux)
 	s.routeRoutes(mux)
+	s.podNodeRoutes(mux)
+	s.nodeIPRoutes(mux)
+	s.probeRoutes(mux)
 	s.terminalRoutes(mux)
 	s.pvcRoutes(mux)
 	s.overviewRoutes(mux)
@@ -462,7 +473,8 @@ func (s *Server) routes() http.Handler {
 	s.dnsRoutes(mux)
 
 	mux.HandleFunc("GET /api/info", func(w http.ResponseWriter, r *http.Request) {
-		info := map[string]any{"version": version, "readOnly": s.readOnly, "shell": s.shellAllowed(r), "os": runtime.GOOS, "admin": s.isAdmin(r)}
+		_, kerr := exec.LookPath("kubectl")
+		info := map[string]any{"version": version, "readOnly": s.readOnly, "shell": s.shellAllowed(r), "console": kerr == nil, "os": runtime.GOOS, "admin": s.isAdmin(r)}
 		if u := reqUser(r); u != nil {
 			info["user"] = u.view()
 		}

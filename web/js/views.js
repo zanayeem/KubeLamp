@@ -131,7 +131,7 @@ async function viewHome() {
         ${attnBlock(c)}${certLine(c)}`;
       return `<div class="card ccard" data-ctx="${esc(c.name)}">
         <div class="top"><i class="dot ${c.status}" style="margin-top:5px"></i><div style="min-width:0;flex:1"><div class="nm">${esc(shortName(c.name))}</div>${sub}</div>
-        <div style="display:flex;gap:4px;flex-direction:column;align-items:flex-end">${c.version ? `<span class="tag">${esc(c.version)}</span>` : ''}${c.current ? '<span class="tag cur">current</span>' : ''}${isNs(c) ? '<span class="tag" title="Role/RoleBinding access">namespace-scoped</span>' : ''}</div></div>
+        <div style="display:flex;gap:4px;flex-direction:column;align-items:flex-end">${c.version ? `<span class="tag">${esc(c.version)}</span>` : ''}${c.current ? '<span class="tag cur">current</span>' : ''}</div></div>
         ${body}</div>`;
     }).join('');
     $('#cards').innerHTML = cards || `<div class="empty-state"><h2>No clusters yet</h2><p>The loaded kubeconfig has no contexts.</p><button class="btn primary" type="button" onclick="openKubeconfigs()">Add a kubeconfig</button></div>`;
@@ -157,15 +157,13 @@ function nsListHtml(list, max = 12) {
   if (list.length <= max) return b(list);
   return `${b(list.slice(0, max))}<span class="ns-rest" hidden><b>, ${esc(list.slice(max).join(', '))}</b></span> <button class="ns-more" type="button" onclick="this.previousElementSibling.hidden=false;this.remove()">+${list.length - max} more</button>`;
 }
-function clusterHead(sum, title, crumbs = '') {
+function clusterHead(sum, title, crumbs = '', { actions = true } = {}) {
   const c = sum;
   return `<div class="page-head"><div>${crumbs}<h1>${esc(title)}</h1>
     <div class="sub"><span>${stLabel(c.status === 'ok' ? 'Connected' : c.status === 'partial' ? 'Partially readable' : c.status, c.status === 'ok' ? 'good' : 'warning')}</span>
     ${c.version ? `<span>${esc(c.version)}</span>` : ''}<span class="mono">${esc(c.server)}</span><span>${esc(c.authType)}</span>
     <span class="muted" id="updated">updated ${c.at ? age(c.at) + ' ago' : '—'}</span></div></div>
-    <div class="right"><button class="btn" id="accessBtn" title="Cluster-wide or namespace-scoped (Role/RoleBinding) access"><svg viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>${esc(isNs(c) ? 'Namespaces: ' + (c.scopeNamespaces || []).length : 'Access')}</button><button class="btn" id="refreshBtn"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg>Refresh</button></div></div>
-    ${isNs(c) ? `<div class="banner info ns-banner"><b>Namespace-scoped</b><span><b>${(c.scopeNamespaces || []).length} namespace${(c.scopeNamespaces || []).length === 1 ? '' : 's'}</b>${c.scopeFoundBy ? ` ${FOUND_BY[c.scopeFoundBy] || 'found automatically'}` : ''}: ${nsListHtml(c.scopeNamespaces || [], 4)}
-      <span class="muted ns-note">${c.nodesTotal ? 'Nodes are shown because your user may list them; node requests count only your pods' : 'Nodes and cluster capacity need cluster-wide rights'}${c.cpu.quota || c.mem.quota ? '; ResourceQuota is used as the capacity line' : ''}. <a href="#" data-acc>Manage</a></span></span></div>` : ''}
+    <div class="right">${actions ? `<button class="btn" id="accessBtn" title="Cluster-wide or namespace-scoped (Role/RoleBinding) access"><svg viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>${esc(isNs(c) ? 'Namespaces: ' + (c.scopeNamespaces || []).length : 'Access')}</button><button class="btn" id="refreshBtn"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg>Refresh</button>` : ''}</div></div>
     ${certBanner(c)}
     ${c.status === 'partial' ? `<div class="banner"><b>Some data is missing.</b><span>${esc(c.error)}</span></div>` : ''}
     ${!c.metricsAvailable ? (/forbidden|RBAC/i.test(c.metricsErr || '')
@@ -263,14 +261,141 @@ function eventsList(evs) {
 }
 
 // ------------------------------------------------------------------ NODES
+// Nodes seen through your pods (spec.nodeName, status.hostIP), like `kubectl get pods -o wide`:
+// for users who can't list nodes, and for "All clusters"
+async function viewPodNodes(route, sum, all) {
+  const ctx = route.ctx;
+  const ctxs = all ? S.clusters.filter(c => c.status !== 'error').map(c => c.name) : [ctx];
+  const head = all
+    ? `<div class="page-head"><div><div class="crumbs"><a href="#/">All clusters</a></div><h1>Nodes</h1><div class="sub"><span>${ctxs.length} clusters · nodes where your pods run</span></div></div></div>`
+    : clusterHead(sum, 'Nodes', `<div class="crumbs"><a href="${ctxPath(ctx)}/overview">${esc(shortName(ctx))}</a></div>`, { actions: false });
+  main.innerHTML = head + `
+    <div class="filters">${nodesClusterSelect(ctx, all)}<input type="search" id="nq" placeholder="Filter by node, IP, namespace or pod" style="width:300px"><span class="count" id="ncount"></span>
+      ${importBtn()}<button class="btn" id="ndl">${DL_ICON}Download</button></div>
+    <div class="card" id="nodesBox"><div class="muted">Loading…</div></div>`;
+  bindNodesClusterSelect(ctx);
+  if (!all) bindRefresh(ctx, () => render());
+  let rows = [], errs = [];
+  const render = async () => {
+    const got = await Promise.allSettled(ctxs.map(c => api('podnodes?ctx=' + enc(c)).then(d => ({ c, d }))));
+    rows = []; errs = [];
+    got.forEach((g, i) => {
+      if (g.status === 'rejected') { if (g.reason?.name !== 'AbortError') errs.push(`${shortName(ctxs[i])}: ${g.reason?.message}`); return; }
+      g.value.d.nodes.forEach(n => rows.push({ ...n, cluster: g.value.c, ipSource: g.value.d.ipSource }));
+    });
+    draw();
+  };
+  const shown = () => {
+    const q = ($('#nq')?.value || '').toLowerCase().trim();
+    return rows.filter(n => !q || [n.name, n.externalIP, n.internalIP, shortName(n.cluster), ...n.namespaces, ...n.podNames].join(' ').toLowerCase().includes(q));
+  };
+  const draw = () => {
+    const list = shown();
+    const cols = [];
+    if (all) cols.push({ key: 'cluster', label: 'Cluster', render: n => `<a href="${ctxPath(n.cluster)}/nodes">${esc(shortName(n.cluster))}</a>` });
+    cols.push(
+      { key: 'name', label: 'Node (host name)', cls: 'name', render: n => esc(n.name) },
+      { key: 'externalIP', label: 'External IP', sort: n => ipSortKey(n.externalIP), render: extIPCell },
+      { key: 'internalIP', label: 'Internal IP', sort: n => ipSortKey(n.internalIP), render: intIPCell },
+      { key: 'pods', label: 'Your pods', num: true, render: n => !n.pods ? '<span class="muted">0</span>' : `<a href="${ctxPath(n.cluster)}/pods?q=${enc(n.name)}" title="Show these pods">${n.running}${n.running !== n.pods ? `<span class="muted"> / ${n.pods}</span>` : ''}</a>` },
+      { key: 'namespaces', label: 'Namespaces', nosort: true, render: n => !n.namespaces.length ? '<span class="muted">none of your pods run here</span>' : `<span class="chips">${n.namespaces.slice(0, 4).map(x => `<span class="chip">${esc(x)}</span>`).join('')}${n.namespaces.length > 4 ? `<span class="muted">+${n.namespaces.length - 4}</span>` : ''}</span>` },
+    );
+    const t = table('podnodes', cols, list, { sort: { key: all ? 'cluster' : 'name', dir: 'asc' } });
+    $('#nodesBox').innerHTML = (errs.length ? `<div class="banner err" style="margin:0 0 10px"><b>Not loaded.</b><span>${esc(errs.join('; '))}</span></div>` : '')
+      + (rows.length ? t.html : `<div class="muted" style="padding:6px">None of your pods is on a node yet.</div>`);
+    t.bind($('#nodesBox'), draw);
+    bindIPEdits($('#nodesBox'), render);
+    $('#ncount').textContent = `${list.length} of ${rows.length} nodes`;
+  };
+  $('#nq').addEventListener('input', draw);
+  $('#nimp')?.addEventListener('click', () => importNodeIPs(render));
+  $('#ndl').onclick = e => downloadMenu(e.currentTarget, all ? 'nodes-all-clusters' : `nodes-${shortName(ctx)}`, () => [
+    ['Cluster', 'Node', 'External IP', 'External IP source', 'Internal IP', 'Running pods', 'Pods', 'Namespaces'],
+    ...shown().map(n => [shortName(n.cluster), n.name, n.externalIP || '', IP_SRC[n.externalSrc] || '', n.internalIP, n.running, n.pods, n.namespaces.join(' ')])]);
+  await live(20000, render);
+}
+const DL_ICON = '<svg viewBox="0 0 24 24"><path d="M12 4v11M7.5 10.5L12 15l4.5-4.5"/><path d="M4 16v2.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V16"/></svg>';
+// External / internal IP cells. External: set by an admin, the node's ExternalIP, or
+// Rancher's; admins can edit it or set it where none is known.
+const IP_SRC = { manual: 'set by an admin', node: 'from the node', rancher: 'from Rancher' };
+const ipSortKey = ip => (ip || '').split('.').map(x => x.padStart(3, '0')).join('.');
+function extIPCell(n) {
+  const admin = S.info?.admin;
+  const edit = admin ? `<button class="icon-btn ip-edit" data-setip="${esc(n.name)}" data-cur="${esc(n.externalSrc === 'manual' ? n.externalIP : '')}" title="Set the external IP">${ICON.edit}</button>` : '';
+  if (n.externalIP) return `<span class="ip-ext" title="${esc(IP_SRC[n.externalSrc] || '')}">${esc(n.externalIP)}</span>${n.externalSrc === 'manual' ? '<span class="ip-src">manual</span>' : ''}${edit}`;
+  return admin ? `<button class="btn sm ghost ip-set" data-setip="${esc(n.name)}" data-cur="">${ICON.edit}Set manually</button>` : '<span class="muted">not set</span>';
+}
+const intIPCell = n => n.internalIP ? `<span class="ip-int">${esc(n.internalIP)}</span>` : '<span class="muted">—</span>';
+function bindIPEdits(box, after) {
+  $$('[data-setip]', box).forEach(b => b.addEventListener('click', async e => {
+    e.stopPropagation();
+    const host = b.dataset.setip, cur = b.dataset.cur;
+    const res = await modal({
+      title: `External IP of ${host}`,
+      body: `<label class="field">IP address<input type="text" id="nipVal" value="${esc(cur)}" placeholder="192.0.2.11" spellcheck="false" autocomplete="off"></label>
+        <p class="muted">Shown to everyone on the Nodes pages instead of the address the node registered with Kubernetes. Matched by host name (case and domain don't matter).</p>`,
+      actions: [{ label: 'Cancel', value: null }, ...(cur ? [{ label: 'Remove', kind: 'danger', value: 'remove' }] : []),
+        { label: 'Save', kind: 'primary', submit: true, run: async d => { const ip = $('#nipVal', d).value.trim(); if (!ip) throw new Error('Enter an IP address'); await send('PUT', 'nodeips', { host, ip }); return 'saved'; } }],
+    });
+    if (res === 'remove') { try { await send('PUT', 'nodeips', { host, ip: '' }); } catch (x) { return toast(x.message, 'err'); } }
+    if (res) { toast(res === 'remove' ? `Removed the IP of ${host}` : `Saved the IP of ${host}`); after(); }
+  }));
+}
+async function importNodeIPs(after) {
+  const res = await modal({
+    title: 'Import node IPs', wide: true,
+    body: `<p>One node per line: <b>host name</b> and <b>IP</b>. Copy the two columns from Excel and paste them here, or choose the workbook itself (<code>.xlsx</code>, every sheet is read) or a CSV.
+      Host names match regardless of case and domain; existing entries are updated.</p>
+      <label class="field">Paste<textarea id="nipText" rows="8" spellcheck="false" placeholder="worker-01.example.com&#9;192.0.2.11&#10;worker-02.example.com&#9;192.0.2.12"></textarea></label>
+      <label class="field">…or a file<input type="file" id="nipFile" accept=".xlsx,.csv,.txt,text/csv,text/plain,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"></label>`,
+    actions: [{ label: 'Cancel', value: null }, { label: 'Import', kind: 'primary', submit: true, run: async d => {
+      const f = $('#nipFile', d).files[0];
+      let r;
+      if (f) {
+        if (f.size > 10 << 20) throw new Error('The file is larger than 10 MB');
+        r = await fetch(apiURL('nodeips/import'), { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: await f.arrayBuffer() });
+      } else {
+        const text = $('#nipText', d).value;
+        if (!text.trim()) throw new Error('Paste host names and IPs, or choose a file');
+        r = await fetch(apiURL('nodeips/import'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+      }
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw httpErr(r, j);
+      return j;
+    } }],
+  });
+  if (res) { toast(`Imported ${res.imported} node IP${res.imported === 1 ? '' : 's'}${res.skipped?.length ? ` · skipped ${res.skipped.length} line(s) without a host name and IP` : ''}`); after(); }
+}
+const UP_ICON = '<svg viewBox="0 0 24 24"><path d="M12 15V4M7.5 8.5L12 4l4.5 4.5"/><path d="M4 16v2.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V16"/></svg>';
+const importBtn = () => S.info?.admin ? `<button class="btn" id="nimp" title="Set external IPs from a spreadsheet or a pasted list">${UP_ICON}Import IPs</button>` : '';
+
+// Cluster dropdown for the Nodes page: one cluster, or all of them (nodes from pods)
+function nodesClusterSelect(ctx, all) {
+  const list = S.clusters.filter(c => c.status !== 'error' || c.name === ctx);
+  return `<select id="ncl" data-label="Cluster"><option value="*" ${all ? 'selected' : ''}>All clusters</option>${list.map(c => `<option value="${esc(c.name)}" ${!all && c.name === ctx ? 'selected' : ''}>${esc(shortName(c.name))}</option>`).join('')}</select>`;
+}
+function bindNodesClusterSelect(ctx) {
+  $('#ncl')?.addEventListener('change', e => {
+    const v = e.target.value;
+    location.hash = v === '*' ? `${ctxPath(ctx)}/nodes?all=1` : `${ctxPath(v)}/nodes`;
+  });
+}
+
 async function viewNodes(route) {
   const ctx = route.ctx;
+  if (route.q.all === '1') return viewPodNodes(route, null, true);
+  // no rights to list nodes: show the nodes from your pods instead (decided once)
+  const [d0, sum0] = await Promise.all([api('nodes?ctx=' + enc(ctx)), api('clusters').then(l => l.find(c => c.name === ctx))]);
+  if (!d0.nodes.length && isNs(sum0)) return viewPodNodes(route, sum0, false);
+  let built = false; // this page's layout, built once (never reuse the previous page's)
   const render = async () => {
     const [d, sum] = await Promise.all([api('nodes?ctx=' + enc(ctx)), api('clusters').then(l => l.find(c => c.name === ctx))]);
     const q = ($('#nq')?.value || '').toLowerCase();
-    const rows = d.nodes.filter(n => !q || n.name.toLowerCase().includes(q) || n.roles.join().includes(q));
+    const rows = d.nodes.filter(n => !q || n.name.toLowerCase().includes(q) || n.roles.join().includes(q) || (n.internalIP || '').includes(q) || (n.externalIP || '').includes(q));
     const t = table('nodes', [
-      { key: 'name', label: 'Node', cls: 'name', render: n => `${esc(n.name)}<span class="sub">${esc(n.roles.join(', '))} · ${esc(n.internalIP)}</span>` },
+      { key: 'name', label: 'Node', cls: 'name', render: n => `${esc(n.name)}<span class="sub">${esc(n.roles.join(', ') || 'worker')}</span>` },
+      { key: 'externalIP', label: 'External IP', sort: n => ipSortKey(n.externalIP), render: extIPCell },
+      { key: 'internalIP', label: 'Internal IP', sort: n => ipSortKey(n.internalIP), render: intIPCell },
       { key: 'ready', label: 'Status', sort: n => (n.ready ? 1 : 0), render: n => stLabel(n.ready ? (n.pressure.length ? n.pressure.join(', ') : 'Ready') : 'NotReady', n.ready ? (n.pressure.length ? 'warning' : 'good') : 'critical') + (n.unschedulable ? ' <span class="tag">cordoned</span>' : '') },
       { key: 'cpu', label: 'CPU', sort: n => pct(n.cpu.used, n.cpu.alloc), render: n => mcell(n.cpu.used, n.cpu.alloc, n.cpu.req, fmtCPU, d.metrics) },
       { key: 'mem', label: 'Memory', sort: n => pct(n.mem.used, n.mem.alloc), render: n => mcell(n.mem.used, n.mem.alloc, n.mem.req, fmtMem, d.metrics) },
@@ -280,20 +405,22 @@ async function viewNodes(route) {
       { key: 'created', label: 'Age', num: true, sort: n => -new Date(n.created), render: n => age(n.created) },
       { key: 'spark', label: 'CPU 10m', nosort: true, render: n => spark(n.spark) },
     ], rows, { href: n => ctxPath(ctx) + '/node/' + enc(n.name) });
-    if (isNs(sum) && !d.nodes.length) {
-      main.innerHTML = clusterHead(sum, 'Nodes', `<div class="crumbs"><a href="${ctxPath(ctx)}/overview">${esc(shortName(ctx))}</a></div>`) +
-        `<div class="empty-state"><h2>Nodes need cluster-wide access</h2><p>Nodes are cluster-scoped, and your kubeconfig user only has Role/RoleBinding rights in ${esc(nsShort(sum.scopeNamespaces, 6))}.</p>
-        <p class="muted">Pods still show which node they run on. To see nodes, ask for a ClusterRole with <code>get, list</code> on <code>nodes</code> (and <code>nodes</code> in <code>metrics.k8s.io</code>).</p></div>`;
-      bindRefresh(ctx, render);
-      return;
-    }
-    if (!$('#nodesBox')) {
-      main.innerHTML = clusterHead(sum, 'Nodes', `<div class="crumbs"><a href="${ctxPath(ctx)}/overview">${esc(shortName(ctx))}</a></div>`) +
-        `<div class="filters"><input type="search" id="nq" placeholder="Filter by name or role"><span class="count" id="ncount"></span></div><div class="card" id="nodesBox"></div>`;
+    if (!built) {
+      built = true;
+      main.innerHTML = clusterHead(sum, 'Nodes', `<div class="crumbs"><a href="${ctxPath(ctx)}/overview">${esc(shortName(ctx))}</a></div>`, { actions: false }) +
+        `<div class="filters">${nodesClusterSelect(ctx, false)}<input type="search" id="nq" placeholder="Filter by name, role or IP" style="width:260px"><span class="count" id="ncount"></span>
+          ${importBtn()}<button class="btn" id="ndl">${DL_ICON}Download</button></div><div class="card" id="nodesBox"></div>`;
       $('#nq').addEventListener('input', render);
+      $('#nimp')?.addEventListener('click', () => importNodeIPs(render));
+      bindNodesClusterSelect(ctx);
       bindRefresh(ctx, render);
     }
+    $('#ndl').onclick = e => downloadMenu(e.currentTarget, `nodes-${shortName(ctx)}`, () => [
+      ['Node', 'External IP', 'External IP source', 'Internal IP', 'Roles', 'Status', 'CPU allocatable', 'Memory allocatable', 'Pods', 'Pod capacity', 'Kubelet', 'Runtime'],
+      ...rows.map(n => [n.name, n.externalIP || '', IP_SRC[n.externalSrc] || '', n.internalIP, n.roles.join(' '), n.ready ? (n.pressure.length ? n.pressure.join(' ') : 'Ready') : 'NotReady',
+        fmtCPU(n.cpu.alloc), fmtMem(n.mem.alloc), n.pods, n.podCap, n.version, n.runtime])]);
     $('#nodesBox').innerHTML = t.html; t.bind($('#nodesBox'), render);
+    bindIPEdits($('#nodesBox'), render);
     $('#ncount').textContent = `${rows.length} of ${d.nodes.length} nodes`;
   };
   await live(15000, render);
@@ -475,6 +602,7 @@ async function viewPods(route) {
     <div id="pBulk"></div>
     <div class="card" id="pBox"><div class="muted">Loading…</div></div>`;
   if (route.q.status) $('#pst').value = route.q.status;
+  if (route.q.q) $('#pq').value = route.q.q;
   bindRefresh(ctx, () => render());
   // refresh-rate picker (top right), remembered across visits
   const rates = [[1000, '1s'], [5000, '5s'], [10000, '10s'], [30000, '30s'], [60000, '1 min']];
